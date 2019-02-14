@@ -1,11 +1,12 @@
 import paramiko
 import time
 from threading import Thread
-import queue
+import Queue as queue
 import csv
 import os
 import re
 import socket
+import datetime
 import sys
 import logging
 
@@ -77,6 +78,7 @@ class SwitchProcessThreader(Thread):
         self.switch_ip = switch_ip
         self.status_queue = status_queue
         self.flag = True
+        self.stroke_watchdog = False
 
     def run(self):
         self.status_queue.put({"switch_id": self.switch_id, "status": "connecting... (" + self.switch_ip + ")"})
@@ -124,6 +126,16 @@ class SwitchProcessThreader(Thread):
         # Continuously wait for data, unless something went wrong
         while all_good and self.flag:
 
+            # Stroke the watchdog
+            if self.stroke_watchdog:
+                self.stroke_watchdog = False
+                try:
+                    remote_conn.send("\n")
+                except Exception, err:
+                    self.status_queue.put({"switch_id": self.switch_id, "status": "error", "err_msg": str(err)})
+                    all_good = False
+                    continue
+
             try:
                 data = remote_conn.recv(65535)
             except socket.timeout:
@@ -134,16 +146,58 @@ class SwitchProcessThreader(Thread):
                 continue
 
             # Only report if a link went up or down
-            if data.find("%LINK") is not -1:
-                port = data[data.rfind(":") + 1:].strip()
-                if data.find("Up") is not -1:
-                    self.status_queue.put({"switch_id": self.switch_id, "status": "port change", "direction": "UP", "port": port})
-                elif data.find("Down") is not -1:
-                    self.status_queue.put(
-                        {"switch_id": self.switch_id, "status": "port change", "direction": "DOWN", "port": port})
+            # Extract all the entries containing "%LINK" from the switch
+            ranges = [[m.start(), m.end()] for m in re.finditer(r"%LINK.+\n", data)]
+            entries = [data[i[0]:i[1]] for i in ranges]
+
+            if len(entries) > 0:
+                for x in entries:
+                    # Only look at entries that contain "gi" or "fe"
+                    if (x.find("gi") is not -1) or (x.find("fe") is not -1):
+                        port = x[x.rfind(":") + 1:].strip()
+                        if x.find("Up") is not -1:
+                            self.status_queue.put({"switch_id": self.switch_id, "status": "port change", "direction": "UP", "port": port})
+                        elif x.find("Down") is not -1:
+                            self.status_queue.put(
+                                {"switch_id": self.switch_id, "status": "port change", "direction": "DOWN", "port": port})
 
         client.close()
         self.status_queue.put({"switch_id": self.switch_id, "status": "disconnected"}, False, 1)
+
+###################################################################
+
+
+class WatchdogProcessThreader(Thread):
+    def __init__(self, switch_threads):
+        Thread.__init__(self)
+        self.switch_threads = switch_threads
+
+    def run(self):
+        while True:
+            time.sleep(60)
+            for x in self.switch_threads:
+                x.stroke_watchdog = True
+
+###################################################################
+
+
+def print_with_date(s):
+    txt = "[" + datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S') + "] " + s
+    print txt
+
+    if False:
+        log = "switches log - " + datetime.datetime.today().strftime('%Y %m %d') + ".txt"
+        with open(log, "a") as f:
+            f.write(txt + "\n")
+
+###################################################################
+
+
+def raw_input_with_date(s):
+    txt = "[" + datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S') + "] " + s
+    ret = raw_input(txt)
+
+    return ret
 
 ###################################################################
 
@@ -214,6 +268,11 @@ def main_program(test_switch):
     for x in threads:
         x.start()
 
+    # Start watchdog thread
+    watchdog_thread = WatchdogProcessThreader(threads)
+    watchdog_thread.daemon = True
+    watchdog_thread.start()
+
     try:
         while True:
             # Grab the next entry in the queue
@@ -223,15 +282,15 @@ def main_program(test_switch):
                 continue
 
             if s["status"] == "error":
-                print "Switch " + str(s["switch_id"]) + " error: " + s["err_msg"]
+                print_with_date("Switch " + str(s["switch_id"]) + " error: " + s["err_msg"])
 
             elif s["status"] == "port change":
                 # Extract port number from text
                 port_num = re.findall(r"\d+", s["port"])[0]
 
                 # Display status
-                print "Switch " + str(s["switch_id"]) + " port " + port_num + " " + s["direction"] + " (" + s[
-                    "port"] + ")"
+                print_with_date("Switch " + str(s["switch_id"]) + " port " + port_num + " " + s["direction"] + " (" + s[
+                    "port"] + ")")
 
                 # Read the entire file into an array
                 try:
@@ -239,13 +298,13 @@ def main_program(test_switch):
                         reader = csv.reader(readFile, delimiter=',')
                         lines = list(reader)
                 except IOError:
-                    print "     Error opening file"
+                    print_with_date("     Error opening file")
                     continue
 
                 # Find row with switch and port
                 row = find_row(lines, s["switch_id"], port_num)
                 if row is None:
-                    print "     Row missing in file"
+                    print_with_date("     Row missing in file")
                     continue
 
                 current_line = lines[row]
@@ -258,17 +317,17 @@ def main_program(test_switch):
                 update_necessary = False
 
                 # Request a new entry
-                print "     Current entry for location " + locations[location-1][1] + " is '" + current_value + "'"
-                user_input = raw_input("     Enter new entry or press 'enter' to keep old: ")
+                print_with_date("     Current entry for location " + locations[location-1][1] + " is '" + current_value + "'")
+                user_input = raw_input_with_date("     Enter new entry or press 'enter' to keep old: ")
 
                 if len(user_input) is 0:
-                    print "     Old value kept"
+                    print_with_date("     Old value kept")
                 else:
                     current_line[location + 2] = user_input
                     current_line[2] = s["port"]
                     lines[row] = current_line
                     update_necessary = True
-                    print "     New value chosen"
+                    print_with_date("     New value chosen")
 
                 # Display description if at wall plug
                 if location == description_loc:
@@ -278,17 +337,17 @@ def main_program(test_switch):
                         current_desc = "empty"
 
                     # Request a new description
-                    print "     Current description for location " + locations[location - 1][1] + " is '" + current_desc + "'"
-                    user_input = raw_input("     Enter new entry or press 'enter' to keep old: ")
+                    print_with_date("     Current description for location " + locations[location - 1][1] + " is '" + current_desc + "'")
+                    user_input = raw_input_with_date("     Enter new entry or press 'enter' to keep old: ")
 
                     if len(user_input) is 0:
-                        print "     Old value kept"
+                        print_with_date("     Old value kept")
                     else:
                         current_line[len(locations) + 3] = user_input
                         current_line[2] = s["port"]
                         lines[row] = current_line
                         update_necessary = True
-                        print "     New value chosen"
+                        print_with_date("     New value chosen")
 
                 # Write update to file if necessary
                 if update_necessary:
@@ -300,16 +359,16 @@ def main_program(test_switch):
                                 writer.writerows(lines)
                         except IOError:
                             success = False
-                            raw_input("     Error writing to file. Press enter to try again.")
+                            raw_input_with_date("     Error writing to file. Press enter to try again.")
                         else:
                             success = True
-                            print "     New value(s) written to file"
+                            print_with_date("     New value(s) written to file")
 
             else:
-                print "Switch " + str(s["switch_id"]) + " " + s["status"]
+                print_with_date("Switch " + str(s["switch_id"]) + " " + s["status"])
 
     except KeyboardInterrupt:
-        print "Program exiting..."
+        print_with_date("Program exiting...")
 
         # Set the exit flag in each thread
         for x in threads:
@@ -323,7 +382,7 @@ def main_program(test_switch):
         while not status_queue.empty():
             # Grab the next entry in the queue
             s = status_queue.get_nowait()
-            print "Switch " + str(s["switch_id"]) + " " + s["status"]
+            print_with_date("Switch " + str(s["switch_id"]) + " " + s["status"])
 
 ###################################################################
 
